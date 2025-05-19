@@ -1,0 +1,165 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Data Lake with ETL and Analytics using S3, Glue, Athena, Lambda, and Step Functions
+
+Parameters:
+  BucketName:
+    Type: String
+    Description: S3 bucket name for Data Lake
+
+Resources:
+
+  DataLakeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BucketName
+
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: data_lake_db
+
+  GlueCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: raw-data-crawler
+      Role: !GetAtt GlueServiceRole.Arn
+      DatabaseName: !Ref GlueDatabase
+      Targets:
+        S3Targets:
+          - Path: !Sub s3://${BucketName}/raw/
+      Schedule:
+        ScheduleExpression: "cron(0 * * * ? *)"
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: DEPRECATE_IN_DATABASE
+
+  GlueJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: clean-transform-job
+      Role: !GetAtt GlueServiceRole.Arn
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub s3://${BucketName}/scripts/transform.py
+        PythonVersion: "3"
+      GlueVersion: "3.0"
+      DefaultArguments:
+        "--job-language": "python"
+        "--TempDir": !Sub s3://${BucketName}/tmp/
+      MaxRetries: 1
+      NumberOfWorkers: 2
+      WorkerType: Standard
+
+  GlueServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: glue-etl-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+
+  AthenaLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: trigger-athena-query
+      Runtime: python3.9
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: |
+          import boto3
+          def lambda_handler(event, context):
+              client = boto3.client('athena')
+              response = client.start_query_execution(
+                  QueryString='SELECT * FROM "data_lake_db"."processed_table" limit 10;',
+                  QueryExecutionContext={'Database': 'data_lake_db'},
+                  ResultConfiguration={'OutputLocation': f's3://{event["bucket"]}/athena-results/'}
+              )
+              return {"QueryExecutionId": response['QueryExecutionId']}
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: lambda-athena-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AthenaExecutionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - athena:StartQueryExecution
+                  - athena:GetQueryExecution
+                  - athena:GetQueryResults
+                  - s3:*
+                Resource: "*"
+
+  StepFunction:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      RoleArn: !GetAtt StepFunctionRole.Arn
+      StateMachineName: ETL-Pipeline
+      DefinitionString: !Sub |
+        {
+          "Comment": "ETL Automation using Glue and Lambda",
+          "StartAt": "Run Glue Job",
+          "States": {
+            "Run Glue Job": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::glue:startJobRun.sync",
+              "Parameters": {
+                "JobName": "clean-transform-job"
+              },
+              "Next": "Run Athena Query"
+            },
+            "Run Athena Query": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${AthenaLambdaFunction}",
+                "Payload": {
+                  "bucket": "${BucketName}"
+                }
+              },
+              "End": true
+            }
+          }
+        }
+
+  StepFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: stepfunction-etl-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StepFunctionETLPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:StartJobRun
+                  - lambda:InvokeFunction
+                Resource: "*"
